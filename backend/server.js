@@ -1,17 +1,17 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
-const movieRoutes = require("./routes/recommendationRoutes"); // Import the recommendation routes
+const movieRoutes = require('./routes/recommendationRoutes'); // Flask recommendations proxy
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection
-const uri = 'mongodb://localhost:27017';
+// MongoDB
+const uri = 'mongodb://127.0.0.1:27017';
 const client = new MongoClient(uri);
 let db;
 
@@ -20,104 +20,60 @@ async function connectToMongo() {
     await client.connect();
     console.log('Connected to MongoDB ✅');
     db = client.db('movies');
-    
-    // Test the connection
+
     const count = await db.collection('tmdb1million').countDocuments({});
     console.log(`Found ${count} movies in the database`);
   } catch (error) {
     console.error('Error connecting to MongoDB:', error);
   }
 }
-
 connectToMongo();
 
-// Enhanced adult content filter that excludes "Unknown Genre" and Japanese content
-const adultContentFilter = {
-    $and: [
-        // Explicit adult flag if present
-        { $or: [
-            { adult: { $ne: true } },
-            { adult: { $exists: false } }
-        ]},
-        // Filter out adult genres and "Unknown Genre"
-        { genres: { 
-            $not: { $regex: 'porn|adult|xxx|erotic|Unknown Genre', $options: 'i' } 
-        }},
-        // Filter out adult keywords in title
-        { title: { 
-            $not: { $regex: 'porn|xxx|adult|erotic|sex', $options: 'i' } 
-        }},
-        // Filter out Japanese language content that might contain adult content
-        { $or: [
-            { original_language: { $ne: 'ja' } },
-            // Allow Japanese anime with high ratings and popular content 
-            { $and: [
-                { original_language: 'ja' },
-                { vote_average: { $gte: 7.0 } },
-                { vote_count: { $gte: 100 } }
-            ]}
-        ]}
-    ]
-};
-
-// Routes
+// GET /api/movies  optional ?genre=Drama
 app.get('/api/movies', async (req, res) => {
   try {
     const { genre } = req.query;
-    let filter = { ...adultContentFilter };
-    
-    if (genre) {
-      // Skip "Unknown Genre" completely
-      if (genre.toLowerCase() === 'unknown genre') {
-        return res.json({ movies: [] });
-      }
-      
-      // Using regex to find the genre anywhere in the genres string
-      filter.$and.push({ genres: { $regex: genre, $options: 'i' } });
-      console.log('Using genre filter:', filter);
-      
-      // For genres, get all matching movies (no limit)
-      const movies = await db.collection('tmdb1million').find(filter).toArray();
-      console.log(`Found ${movies.length} movies for genre: ${genre}`);
-      
-      res.json({ movies });
-    } else {
-      // For home page, still limit to a reasonable number
-      const movies = await db.collection('tmdb1million').find(filter).limit(20).toArray();
-      console.log(`Found ${movies.length} movies for home page`);
-      
-      res.json({ movies });
+    const col = db.collection('tmdb1million');
+
+    // Home feed
+    if (!genre) {
+      const movies = await col.find({}).limit(20).toArray();
+      return res.json({ movies });
     }
+
+    if (genre.toLowerCase() === 'unknown genre') {
+      return res.json({ movies: [] });
+    }
+
+    // Instant indexed lookup on the multikey index
+    const movies = await col
+      .find({ genres_tokens: genre })
+      .limit(50)
+      .toArray();
+
+    return res.json({ movies });
   } catch (error) {
     console.error('Error fetching movies:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Search endpoint
+// GET /api/movies/search?query=Inception
 app.get('/api/movies/search', async (req, res) => {
   try {
     const { query } = req.query;
-    
     if (!query) {
       return res.status(400).json({ error: 'Search query is required' });
     }
-    
-    console.log('Searching for movies with query:', query);
-    
-    // Create search filter with title search and adult content filtering
-    const filter = {
-      ...adultContentFilter,
-      $and: [
-        ...adultContentFilter.$and,
-        { title: { $regex: query, $options: 'i' } }
-      ]
-    };
-    
-    console.log('Using search filter:', filter);
-    const movies = await db.collection('tmdb1million').find(filter).limit(100).toArray();
-    console.log(`Found ${movies.length} movies matching query: ${query}`);
-    
+
+    const movies = await db
+      .collection('tmdb1million')
+      .find({
+        title: { $regex: query, $options: 'i' }
+      })
+      .limit(100)
+      .toArray();
+
     res.json({ movies });
   } catch (error) {
     console.error('Error searching movies:', error);
@@ -125,102 +81,64 @@ app.get('/api/movies/search', async (req, res) => {
   }
 });
 
-// Updated endpoint for random movie with enhanced adult content filtering
+// GET /api/movies/random
 app.get('/api/movies/random', async (req, res) => {
   try {
-    console.log('Fetching a random movie');
-    
-    // Enhanced filter to exclude adult content and ensure quality
-    const filter = { 
+    const filter = {
       poster_path: { $ne: null },
-      vote_average: { $gte: 6.0 },
-      ...adultContentFilter
+      vote_average: { $gte: 6.0 }
     };
-    
-    console.log('Using filter to exclude adult content:', filter);
-    
-    // Count matching documents to get a random index
-    const count = await db.collection('tmdb1million').countDocuments(filter);
-    
+
+    const col = db.collection('tmdb1million');
+    const count = await col.countDocuments(filter);
     if (count === 0) {
-      console.log('No movies found matching criteria');
       return res.status(404).json({ error: 'No movies found' });
     }
-    
-    // Generate a random index
+
     const randomIndex = Math.floor(Math.random() * count);
-    
-    // Skip to the random movie
-    const randomMovie = await db.collection('tmdb1million')
-      .find(filter)
-      .skip(randomIndex)
-      .limit(1)
-      .toArray();
-    
-    if (randomMovie && randomMovie.length > 0) {
-      console.log(`Random movie selected: ${randomMovie[0].title}`);
-      res.json({ movie: randomMovie[0] });
-    } else {
-      console.log('Random movie selection failed');
-      res.status(404).json({ error: 'No movie found' });
+    const randomMovie = await col.find(filter).skip(randomIndex).limit(1).toArray();
+
+    if (randomMovie.length) {
+      return res.json({ movie: randomMovie[0] });
     }
+    res.status(404).json({ error: 'No movie found' });
   } catch (error) {
     console.error('Error fetching random movie:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// GET /api/movie/:id
 app.get('/api/movie/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    console.log(`Looking for movie with ID: ${id}`);
-    
-    // Add adult content filter to details endpoint
-    const filter = {
-      _id: new ObjectId(id),
-      ...adultContentFilter
-    };
-    
-    const movie = await db.collection('tmdb1million').findOne(filter);
-    
-    if (movie) {
-      console.log('Movie found:', movie.title);
-      res.json({ movie });
-    } else {
-      console.log('Movie not found');
-      res.status(404).json({ error: 'Movie not found' });
-    }
+    const movie = await db.collection('tmdb1million').findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!movie) return res.status(404).json({ error: 'Movie not found' });
+    res.json({ movie });
   } catch (error) {
     console.error('Error fetching movie details:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Test route to check database connection and view sample document
+// Test route
 app.get('/api/test-db', async (req, res) => {
   try {
     const sampleMovie = await db.collection('tmdb1million').findOne({});
-    
-    if (sampleMovie) {
-      console.log('Sample movie found:', sampleMovie.title);
-      res.json({ 
-        message: 'Database connection successful!', 
-        sampleMovie,
-        fields: Object.keys(sampleMovie)
-      });
-    } else {
-      res.status(404).json({ error: 'No movies found in collection' });
-    }
+    if (!sampleMovie) return res.status(404).json({ error: 'No movies found in collection' });
+    res.json({ message: 'Database connection successful!', sampleMovie, fields: Object.keys(sampleMovie) });
   } catch (error) {
     console.error('Error testing database:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Routes
-app.use("/api", movieRoutes); // Use the recommendations route under '/api'
+// Recommendations proxy to Flask
+app.use('/api', movieRoutes);
 
-// Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

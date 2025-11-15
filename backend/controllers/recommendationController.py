@@ -16,7 +16,7 @@ def recommend(movie_id):
     return jsonify(result["recommendations"] if result else [])
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(port=5001 , debug=True)
 
 
 
